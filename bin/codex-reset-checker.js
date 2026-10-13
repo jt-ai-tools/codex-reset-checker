@@ -4,13 +4,21 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const https = require('https');
+const crypto = require('crypto');
+const readline = require('readline');
 
 const RATE_LIMIT_API_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits';
+const RESET_CONSUME_API_URL =
+  'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume';
 const USAGE_API_URL = 'https://chatgpt.com/backend-api/wham/usage';
+const ACCOUNT_STATUS_API_URL = 'https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27';
+const GPT_RESERVE_HELP_URL =
+  'https://help.openai.com/zh-hant/articles/20001499-luna-reserve-in-codex-and-chatgpt-work';
 
 const COLOR = process.stdout && process.stdout.isTTY && !process.env.NO_COLOR;
 const CREDIT_WIDTH = 54;
 const CREDIT_GAP = 2;
+const MAX_LAYOUT_WIDTH = 100;
 const WATCH_INTERVAL_MS = 60_000;
 const RESIZE_DEBOUNCE_MS = 100;
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -62,20 +70,41 @@ function printUsage() {
 選項：
   --auth <path>   指定 auth.json 路徑（未提供則依作業系統自動判斷）
   --json          以單行 JSON 輸出查詢結果與標準化使用額度
+  --reset         經確認後使用一筆手動重置額度
+  --reset=<uuid>  以相同冪等鍵重試結果不明的重置操作
+  --force         與 --reset 搭配，略過互動確認直接重置
+  --time-format   日期時間顯示格式：local、utc 或 iso（預設 local）
+  -t, --exact-time  重設時間直接顯示確切時間，不顯示倒數
   -w, --watch     持續監看；Spacebar 刷新，q 結束
+  -v, --version   顯示版本資訊
   -h, --help      顯示說明`);
+}
+
+function printVersion() {
+  console.log(APP_VERSION);
 }
 
 function getCliOptions(cliArgs) {
   let authPath = null;
   let json = false;
   let watch = false;
+  let reset = false;
+  let resetRequestId = null;
+  let force = false;
+  let timeFormat = 'local';
+  let timeFormatSpecified = false;
+  let exactTime = false;
 
   for (let i = 0; i < cliArgs.length; i++) {
     const arg = cliArgs[i];
 
     if (arg === '--help' || arg === '-h') {
       printUsage();
+      process.exit(0);
+    }
+
+    if (arg === '--version' || arg === '-v') {
+      printVersion();
       process.exit(0);
     }
 
@@ -86,6 +115,91 @@ function getCliOptions(cliArgs) {
 
     if (arg === '--watch' || arg === '-w') {
       watch = true;
+      continue;
+    }
+
+    if (arg === '--reset') {
+      if (reset) {
+        throw new Error('--reset 只能指定一次');
+      }
+
+      reset = true;
+      continue;
+    }
+
+    if (arg.startsWith('--reset=')) {
+      const value = arg.slice('--reset='.length);
+      if (!value) {
+        throw new Error('--reset 的冪等鍵不可為空');
+      }
+
+      if (reset) {
+        throw new Error('--reset 只能指定一次');
+      }
+
+      if (!isUuid(value)) {
+        throw new Error('--reset 的冪等鍵必須是有效的 UUID');
+      }
+
+      reset = true;
+      resetRequestId = value.toLowerCase();
+      continue;
+    }
+
+    if (arg === '--force') {
+      if (force) {
+        throw new Error('--force 只能指定一次');
+      }
+
+      force = true;
+      continue;
+    }
+
+    if (arg === '--exact-time' || arg === '-t') {
+      if (exactTime) {
+        throw new Error('--exact-time 只能指定一次');
+      }
+
+      exactTime = true;
+      continue;
+    }
+
+    if (arg === '--time-format') {
+      const value = cliArgs[i + 1];
+      if (!value || value.startsWith('-')) {
+        throw new Error('--time-format 需要指定 local、utc 或 iso');
+      }
+
+      if (timeFormatSpecified) {
+        throw new Error('--time-format 只能指定一次');
+      }
+
+      if (!['local', 'utc', 'iso'].includes(value)) {
+        throw new Error('--time-format 只支援 local、utc 或 iso');
+      }
+
+      timeFormat = value;
+      timeFormatSpecified = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--time-format=')) {
+      const value = arg.slice('--time-format='.length);
+      if (!value) {
+        throw new Error('--time-format 需要指定 local、utc 或 iso');
+      }
+
+      if (timeFormatSpecified) {
+        throw new Error('--time-format 只能指定一次');
+      }
+
+      if (!['local', 'utc', 'iso'].includes(value)) {
+        throw new Error('--time-format 只支援 local、utc 或 iso');
+      }
+
+      timeFormat = value;
+      timeFormatSpecified = true;
       continue;
     }
 
@@ -130,8 +244,20 @@ function getCliOptions(cliArgs) {
     throw new Error(`未知選項：${arg}`);
   }
 
+  if (reset && json) {
+    throw new Error('--reset 不可與 --json 同時使用');
+  }
+
+  if (reset && watch) {
+    throw new Error('--reset 不可與 --watch 同時使用');
+  }
+
+  if (force && !reset) {
+    throw new Error('--force 只能與 --reset 一起使用');
+  }
+
   if (authPath) {
-    return { authPath, json, watch };
+    return { authPath, json, watch, reset, resetRequestId, force, timeFormat, exactTime };
   }
 
   const home = process.platform === 'win32'
@@ -142,7 +268,17 @@ function getCliOptions(cliArgs) {
     authPath: path.join(home, '.codex', 'auth.json'),
     json,
     watch,
+    reset,
+    resetRequestId,
+    force,
+    timeFormat,
+    exactTime,
   };
+}
+
+function isUuid(value) {
+  return typeof value === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 function pad(number) {
@@ -150,6 +286,10 @@ function pad(number) {
 }
 
 function formatShortDate(value) {
+  return formatDateTime(value, 'local', { withSeconds: false });
+}
+
+function formatDateTime(value, timeFormat = 'local', options = {}) {
   if (!value) {
     return 'N/A';
   }
@@ -159,9 +299,28 @@ function formatShortDate(value) {
     return String(value);
   }
 
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(
-    date.getHours()
-  )}:${pad(date.getMinutes())}`;
+  const normalizedFormat = ['local', 'utc', 'iso'].includes(timeFormat) ? timeFormat : 'local';
+  const withSeconds = options.withSeconds === true;
+
+  if (normalizedFormat === 'iso') {
+    return date.toISOString();
+  }
+
+  const isUtc = normalizedFormat === 'utc';
+  const year = isUtc ? date.getUTCFullYear() : date.getFullYear();
+  const month = isUtc ? date.getUTCMonth() + 1 : date.getMonth() + 1;
+  const day = isUtc ? date.getUTCDate() : date.getDate();
+  const hours = isUtc ? date.getUTCHours() : date.getHours();
+  const minutes = isUtc ? date.getUTCMinutes() : date.getMinutes();
+  const seconds = isUtc ? date.getUTCSeconds() : date.getSeconds();
+  const offsetMinutes = isUtc ? 0 : -date.getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? '+' : '-';
+  const absoluteOffset = Math.abs(offsetMinutes);
+  const tzString = `${sign}${pad(Math.floor(absoluteOffset / 60))}:${pad(absoluteOffset % 60)}`;
+
+  const datePart = `${year}-${pad(month)}-${pad(day)} ${pad(hours)}:${pad(minutes)}`;
+  const timePart = withSeconds ? `:${pad(seconds)}` : '';
+  return `${datePart}${timePart} ${tzString}`;
 }
 
 function compactRemaining(expireValue) {
@@ -241,25 +400,7 @@ function compactRemaining(expireValue) {
 }
 
 function formatLocalTime(value) {
-  if (!value) {
-    return 'N/A';
-  }
-
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return String(value);
-  }
-
-  const offsetMinutes = -date.getTimezoneOffset();
-  const sign = offsetMinutes >= 0 ? '+' : '-';
-  const absoluteOffset = Math.abs(offsetMinutes);
-  const tzHour = pad(Math.floor(absoluteOffset / 60));
-  const tzMinute = pad(absoluteOffset % 60);
-  const tzString = `${sign}${tzHour}:${tzMinute}`;
-
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(
-    date.getHours()
-  )}:${pad(date.getMinutes())}:${pad(date.getSeconds())} ${tzString}`;
+  return formatDateTime(value, 'local', { withSeconds: true });
 }
 
 function humanizeRemaining(expireValue) {
@@ -313,6 +454,23 @@ function loadAuth(authPath) {
   } catch (error) {
     throw new Error(`讀取或解析 auth.json 失敗：${error.message}`);
   }
+}
+
+function loadCredentials(authPath) {
+  const auth = loadAuth(authPath);
+  const tokens = auth && typeof auth === 'object' && auth.tokens ? auth.tokens : {};
+  const accessToken = tokens.access_token;
+  const accountId = tokens.account_id;
+
+  if (typeof accessToken !== 'string' || !accessToken.trim()) {
+    throw new Error('auth.json 內未找到 tokens.access_token');
+  }
+
+  return {
+    accessToken,
+    accountId,
+    idToken: tokens.id_token,
+  };
 }
 
 function isObject(value) {
@@ -372,15 +530,35 @@ function formatResponseBody(body, sensitiveValues) {
   return ` 回應內容：${shortened}`;
 }
 
-function requestJson(apiUrl, accessToken, accountId, additionalHeaders = {}, dependencies = {}) {
+function requestJsonRequest(
+  apiUrl,
+  accessToken,
+  accountId,
+  requestOptions = {},
+  dependencies = {}
+) {
+  const method = typeof requestOptions.method === 'string'
+    ? requestOptions.method.toUpperCase()
+    : 'GET';
+  const additionalHeaders = isObject(requestOptions.headers) ? requestOptions.headers : {};
+  const requestBody = requestOptions.body === undefined
+    ? null
+    : JSON.stringify(requestOptions.body);
   const headers = {
     ...buildApiHeaders(accessToken, accountId),
     ...additionalHeaders,
   };
+  if (requestBody !== null) {
+    if (!Object.keys(headers).some((name) => name.toLowerCase() === 'content-type')) {
+      headers['Content-Type'] = 'application/json';
+    }
+    headers['Content-Length'] = Buffer.byteLength(requestBody);
+  }
   const sensitiveValues = [accessToken, accountId];
   const endpoint = new URL(apiUrl);
   const setTimeoutFunction = dependencies.setTimeoutFunction || setTimeout;
   const clearTimeoutFunction = dependencies.clearTimeoutFunction || clearTimeout;
+  const outcomeCanBeUncertain = method !== 'GET' && method !== 'HEAD';
 
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -413,7 +591,7 @@ function requestJson(apiUrl, accessToken, accountId, additionalHeaders = {}, dep
 
     const req = https.request(
       {
-        method: 'GET',
+        method,
         hostname: endpoint.hostname,
         path: endpoint.pathname + endpoint.search,
         headers,
@@ -431,6 +609,7 @@ function requestJson(apiUrl, accessToken, accountId, additionalHeaders = {}, dep
           responseBytes += buffer.length;
           if (responseBytes > MAX_RESPONSE_BYTES) {
             const error = new Error(`API 回應超過 ${MAX_RESPONSE_BYTES} bytes 上限`);
+            error.outcomeUncertain = outcomeCanBeUncertain;
             fail(error);
             if (typeof req.destroy === 'function') {
               req.destroy();
@@ -448,25 +627,35 @@ function requestJson(apiUrl, accessToken, accountId, additionalHeaders = {}, dep
 
           if (res.statusCode < 200 || res.statusCode >= 300) {
             const message = formatResponseBody(chunks, sensitiveValues);
-            fail(new Error(`請求 API 失敗，HTTP ${res.statusCode} ${res.statusMessage}.${message}`));
+            const error = new Error(
+              `請求 API 失敗，HTTP ${res.statusCode} ${res.statusMessage}.${message}`
+            );
+            error.statusCode = res.statusCode;
+            error.outcomeUncertain = outcomeCanBeUncertain && res.statusCode >= 500;
+            fail(error);
             return;
           }
 
           try {
             succeed(JSON.parse(chunks));
           } catch (error) {
-            fail(new Error(`回應 JSON 解析失敗：${error.message}`));
+            const parseError = new Error(`回應 JSON 解析失敗：${error.message}`);
+            parseError.outcomeUncertain = outcomeCanBeUncertain;
+            fail(parseError);
           }
         });
 
         res.on('error', (error) => {
-          fail(new Error(`請求 API 失敗：${error.message}`));
+          const requestError = new Error(`請求 API 失敗：${error.message}`);
+          requestError.outcomeUncertain = outcomeCanBeUncertain;
+          fail(requestError);
         });
       }
     );
 
     timeoutHandle = setTimeoutFunction(() => {
       const error = new Error(`請求 API 逾時（超過 ${REQUEST_TIMEOUT_MS / 1000} 秒）`);
+      error.outcomeUncertain = outcomeCanBeUncertain;
       fail(error);
       if (typeof req.destroy === 'function') {
         req.destroy();
@@ -474,11 +663,29 @@ function requestJson(apiUrl, accessToken, accountId, additionalHeaders = {}, dep
     }, REQUEST_TIMEOUT_MS);
 
     req.on('error', (error) => {
-      fail(new Error(`請求 API 失敗：${error.message}`));
+      const requestError = new Error(`請求 API 失敗：${error.message}`);
+      requestError.outcomeUncertain = outcomeCanBeUncertain;
+      fail(requestError);
     });
 
+    if (requestBody !== null && typeof req.write === 'function') {
+      req.write(requestBody);
+    }
     req.end();
   });
+}
+
+function requestJson(apiUrl, accessToken, accountId, additionalHeaders = {}, dependencies = {}) {
+  return requestJsonRequest(
+    apiUrl,
+    accessToken,
+    accountId,
+    {
+      method: 'GET',
+      headers: additionalHeaders,
+    },
+    dependencies
+  );
 }
 
 function requestRateLimit(accessToken, accountId) {
@@ -487,6 +694,35 @@ function requestRateLimit(accessToken, accountId) {
 
 function requestUsage(accessToken, accountId) {
   return requestJson(USAGE_API_URL, accessToken, accountId);
+}
+
+async function requestAccountStatus(accessToken, accountId) {
+  const headers = { Accept: 'application/json' };
+  try {
+    return await requestJson(ACCOUNT_STATUS_API_URL, accessToken, accountId, headers);
+  } catch (error) {
+    if (error.statusCode !== 403) {
+      throw error;
+    }
+
+    // Cloudflare 會挑戰首次完整 TLS 握手的連線；重試時沿用已快取的 TLS session 即可通過。
+    return requestJson(ACCOUNT_STATUS_API_URL, accessToken, accountId, headers);
+  }
+}
+
+function requestConsumeReset(accessToken, accountId, redeemRequestId, dependencies = {}) {
+  return requestJsonRequest(
+    RESET_CONSUME_API_URL,
+    accessToken,
+    accountId,
+    {
+      method: 'POST',
+      body: {
+        redeem_request_id: redeemRequestId,
+      },
+    },
+    dependencies
+  );
 }
 
 function toFiniteNumber(value) {
@@ -661,6 +897,10 @@ function normalizeAdditionalRateLimitName(value, id) {
     return 'GPT-5.3-Codex-Spark';
   }
 
+  if (identity.includes('reserve')) {
+    return 'gpt-reserve';
+  }
+
   return rawName || id;
 }
 
@@ -675,13 +915,23 @@ function normalizeAdditionalRateLimits(response) {
       const id = rawId === null || rawId === undefined || rawId === ''
         ? `additional-${index + 1}`
         : String(rawId);
-      const name = normalizeAdditionalRateLimitName(
-        getFirstValue(limit, ['display_name', 'title', 'name', 'limit_name', 'metered_limit_name']),
-        id
-      );
-      const identity = `${id} ${name}`.toLowerCase();
-      const isWeekly = identity.includes('weekly') || identity.includes('secondary');
+      const rawDisplayName = getFirstValue(limit, [
+        'display_name',
+        'title',
+        'name',
+        'limit_name',
+        'metered_limit_name',
+      ]);
+      const name = normalizeAdditionalRateLimitName(rawDisplayName, id);
+      const identity = `${id} ${rawDisplayName || ''} ${name}`.toLowerCase();
       const directWindow = getAdditionalRateLimitDirectWindow(limit);
+      const directWindowSeconds = directWindow
+        ? normalizeNonNegativeNumber(directWindow.limit_window_seconds)
+        : null;
+      const isWeekly = identity.includes('weekly')
+        || identity.includes('secondary')
+        || identity.includes('reserve')
+        || (directWindowSeconds !== null && directWindowSeconds >= 6 * 24 * 60 * 60);
       let primarySource = getAdditionalRateLimitWindow(limit, 'primary_window');
       let secondarySource = getAdditionalRateLimitWindow(limit, 'secondary_window');
 
@@ -693,11 +943,13 @@ function normalizeAdditionalRateLimits(response) {
         }
       }
 
+      const primaryFallback = isWeekly ? '每週額度' : '目前工作階段';
+
       return {
         id,
         name,
         primary_window: primarySource
-          ? normalizeUsageWindow(primarySource, '目前工作階段')
+          ? normalizeUsageWindow(primarySource, primaryFallback)
           : null,
         secondary_window: secondarySource
           ? normalizeUsageWindow(secondarySource, '每週額度')
@@ -767,7 +1019,31 @@ function getUsageResetSeconds(window) {
   return null;
 }
 
-function formatUsageReset(window) {
+function getUsageResetTimestamp(window) {
+  if (!isObject(window)) {
+    return null;
+  }
+
+  if (window.reset_at !== null && window.reset_at !== undefined) {
+    const numericResetAt = Number(window.reset_at);
+    if (Number.isFinite(numericResetAt)) {
+      return numericResetAt * 1000;
+    }
+    const parsed = new Date(window.reset_at);
+    return Number.isNaN(parsed.getTime()) ? null : parsed.getTime();
+  }
+
+  if (window.reset_after_seconds !== null && window.reset_after_seconds !== undefined) {
+    const numericSeconds = Number(window.reset_after_seconds);
+    if (Number.isFinite(numericSeconds)) {
+      return Date.now() + numericSeconds * 1000;
+    }
+  }
+
+  return null;
+}
+
+function formatUsageReset(window, options = {}) {
   const seconds = getUsageResetSeconds(window);
   if (seconds === null) {
     return '重置時間：未提供';
@@ -775,6 +1051,13 @@ function formatUsageReset(window) {
 
   if (seconds <= 0) {
     return '已到重置時間';
+  }
+
+  if (options.exactTime) {
+    const timestamp = getUsageResetTimestamp(window);
+    if (timestamp !== null) {
+      return `於 ${formatDateTime(timestamp, options.timeFormat || 'local', { withSeconds: false })} 重置`;
+    }
   }
 
   return `約 ${formatCompactDurationFromSeconds(seconds)} 後重置`;
@@ -799,6 +1082,50 @@ function getUsageColor(usedPercent) {
 const USAGE_CARD_WIDTH = 42;
 const USAGE_BAR_WIDTH = 28;
 const USAGE_CARD_GAP = 2;
+const USAGE_CARD_RESET_LINE_INDEX = 3;
+const MOUSE_INPUT_BUFFER_LIMIT = 128;
+
+function extractMouseEvents(input) {
+  const events = [];
+  let rest = input;
+  const sgrPattern = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])/;
+  const x10Pattern = /^\x1b\[M([\s\S])([\s\S])([\s\S])/;
+  let matched = true;
+
+  while (matched) {
+    matched = false;
+
+    const sgr = rest.match(sgrPattern);
+    if (sgr) {
+      events.push({
+        button: Number(sgr[1]),
+        col: Number(sgr[2]),
+        row: Number(sgr[3]),
+        press: sgr[4] === 'M',
+      });
+      rest = rest.slice(sgr[0].length);
+      matched = true;
+      continue;
+    }
+
+    const x10 = rest.match(x10Pattern);
+    if (x10) {
+      events.push({
+        button: x10[1].charCodeAt(0) - 32,
+        col: x10[2].charCodeAt(0) - 32,
+        row: x10[3].charCodeAt(0) - 32,
+        press: true,
+      });
+      rest = rest.slice(x10[0].length);
+      matched = true;
+    }
+  }
+
+  return {
+    events,
+    rest,
+  };
+}
 
 function getCurrentTerminalWidth() {
   if (!process.stdout) {
@@ -853,6 +1180,36 @@ function getUsageCardTitle(label, windowType) {
   return `${label} ${suffix}`;
 }
 
+function supportsTerminalHyperlinks(output = process.stdout, environment = process.env) {
+  return Boolean(output && output.isTTY && environment.TERM !== 'dumb');
+}
+
+function formatUsageCardTitle(
+  title,
+  hyperlinksEnabled = supportsTerminalHyperlinks(),
+  colorsEnabled = COLOR
+) {
+  const text = String(title);
+  const match = /\bgpt-reserve\b/.exec(text);
+  const dim = (value) => colorsEnabled && value
+    ? `\x1b[2m${value}\x1b[0m`
+    : value;
+
+  if (!hyperlinksEnabled || !match) {
+    return dim(text);
+  }
+
+  const before = text.slice(0, match.index);
+  const after = text.slice(match.index + match[0].length);
+  const hyperlink = `\x1b]8;;${GPT_RESERVE_HELP_URL}\x1b\\gpt-reserve\x1b]8;;\x1b\\`;
+  // 使用可由終端機主題重新映射的 ANSI 色盤，避免固定 RGB 在深色或淺色主題失去對比。
+  const linkedLabel = colorsEnabled
+    ? `\x1b[36;4m${hyperlink}\x1b[0m`
+    : hyperlink;
+
+  return `${dim(before)}${linkedLabel}${dim(after)}`;
+}
+
 function centerText(value, width) {
   const text = String(value);
   const padding = Math.max(0, width - textDisplayWidth(text));
@@ -877,15 +1234,15 @@ function buildRoundedBoxLines(contentLines, contentWidth) {
   return [paint('bold', top), ...body, paint('bold', bottom)];
 }
 
-function buildUsageCardLines(title, window, contentWidth = USAGE_CARD_WIDTH) {
+function buildUsageCardLines(title, window, contentWidth = USAGE_CARD_WIDTH, displayOptions = {}) {
   const color = getUsageColor(window.used_percent);
   const remaining = formatPercent(window.remaining_percent);
   const used = formatPercent(window.used_percent);
-  const reset = formatUsageReset(window)
+  const reset = formatUsageReset(window, displayOptions)
     .replace(/^重置時間：/, '')
     .replace(/重置$/, '重設');
   const contentLines = [
-    paint('dim', title),
+    formatUsageCardTitle(title, displayOptions.hyperlinks, displayOptions.colors),
     `${paint(color, remaining)} ${paint('dim', '剩餘')} ${paint('gray', `・已使用 ${used}`)}`,
     buildUsageProgressBar(
       window.remaining_percent,
@@ -938,22 +1295,83 @@ function getUsageLayout(cards, maxTotalWidth = 0) {
   };
 }
 
-function printUsageCards(cards, layout = getUsageLayout(cards)) {
+function printUsageCards(cards, layout = getUsageLayout(cards), displayOptions = {}) {
+  const renderState = displayOptions.renderState || null;
   const normalizedCards = cards.map((card) => ({
-    lines: buildUsageCardLines(card.title, card.window, layout.cardContentWidth),
+    lines: buildUsageCardLines(card.title, card.window, layout.cardContentWidth, displayOptions),
   }));
 
+  const cardOuterWidth = layout.cardContentWidth + 4;
+  let printedLines = 0;
+
   if (layout.twoColumns) {
-    printCreditCardsInTwoColumns(
+    printedLines = printCreditCardsInTwoColumns(
       normalizedCards,
       layout.terminalWidth,
       layout.cardContentWidth,
       USAGE_CARD_GAP
     );
-    return;
+    if (renderState) {
+      const rowHeight = Math.max(...normalizedCards.map((card) => card.lines.length));
+      const gap = USAGE_CARD_GAP;
+      let pairIndex = 0;
+      for (let i = 0; i < normalizedCards.length; i += 2) {
+        const pairBaseRow = renderState.row + pairIndex * rowHeight;
+        pairIndex += 1;
+        const zoneRow = pairBaseRow + USAGE_CARD_RESET_LINE_INDEX + 2;
+        renderState.zones.push({
+          row: zoneRow,
+          colStart: 1,
+          colEnd: cardOuterWidth - 1,
+        });
+        if (normalizedCards[i + 1]) {
+          const rightEdge = cardOuterWidth + gap + 1;
+          renderState.zones.push({
+            row: zoneRow,
+            colStart: rightEdge,
+            colEnd: rightEdge + cardOuterWidth - 2,
+          });
+        }
+      }
+    }
+  } else {
+    printedLines = printCreditCardsInSingleColumn(normalizedCards);
+    if (renderState) {
+      let baseRow = renderState.row;
+      normalizedCards.forEach((card) => {
+        renderState.zones.push({
+          row: baseRow + USAGE_CARD_RESET_LINE_INDEX + 2,
+          colStart: 1,
+          colEnd: cardOuterWidth - 1,
+        });
+        baseRow += card.lines.length;
+      });
+    }
   }
 
-  printCreditCardsInSingleColumn(normalizedCards);
+  if (renderState) {
+    renderState.row += printedLines;
+  }
+  return printedLines;
+}
+
+// 卡片顯示順序：gpt-reserve 緊接在主要額度之後，其餘（例如 Spark）依原始順序排在最後。
+const ADDITIONAL_RATE_LIMIT_DISPLAY_ORDER = ['gpt-reserve', 'GPT-5.3-Codex-Spark'];
+
+function getAdditionalRateLimitDisplayRank(limit) {
+  const index = ADDITIONAL_RATE_LIMIT_DISPLAY_ORDER.indexOf(limit && limit.name);
+  return index === -1 ? ADDITIONAL_RATE_LIMIT_DISPLAY_ORDER.length : index;
+}
+
+function sortAdditionalRateLimitsForDisplay(limits) {
+  return limits
+    .map((limit, index) => ({ limit, index }))
+    .sort((a, b) => {
+      const rankDiff = getAdditionalRateLimitDisplayRank(a.limit)
+        - getAdditionalRateLimitDisplayRank(b.limit);
+      return rankDiff !== 0 ? rankDiff : a.index - b.index;
+    })
+    .map((entry) => entry.limit);
 }
 
 function getUsageCards(usage) {
@@ -979,7 +1397,7 @@ function getUsageCards(usage) {
   }
 
   const additionalRateLimits = Array.isArray(usage.additional_rate_limits)
-    ? usage.additional_rate_limits
+    ? sortAdditionalRateLimitsForDisplay(usage.additional_rate_limits)
     : [];
   additionalRateLimits.forEach((limit) => {
     if (limit.primary_window) {
@@ -1002,7 +1420,7 @@ function getUsageCards(usage) {
   return cards;
 }
 
-function printUsageSection(usage, layout) {
+function printUsageSection(usage, layout, displayOptions = {}) {
   console.log(paint('bold', '使用額度'));
 
   const cards = getUsageCards(usage);
@@ -1011,7 +1429,11 @@ function printUsageSection(usage, layout) {
     return;
   }
 
-  printUsageCards(cards, layout || getUsageLayout(cards));
+  const renderState = displayOptions.renderState || null;
+  if (renderState) {
+    renderState.row += 1;
+  }
+  printUsageCards(cards, layout || getUsageLayout(cards), displayOptions);
 }
 
 function parseStatusMood(status) {
@@ -1073,14 +1495,21 @@ function parseStatusMood(status) {
 }
 
 function buildCreditLine(prefix, content, width = CREDIT_WIDTH) {
-  const text = `${prefix}${String(content || '')}`;
+  if (width === undefined && typeof content === 'number') {
+    width = content;
+    content = prefix;
+    prefix = '';
+  }
+  const text = `${prefix || ''}${String(content || '')}`;
   const visibleLen = textDisplayWidth(text);
   const padding = Math.max(0, width - visibleLen);
   return `│ ${text}${' '.repeat(padding)} │`;
 }
 
 function stripAnsi(value) {
-  return String(value).replace(/\x1b\[[0-9;]*m/g, '');
+  return String(value)
+    .replace(/\x1b\]8;;[^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b\[[0-9;]*m/g, '');
 }
 
 function textDisplayWidth(value) {
@@ -1106,10 +1535,11 @@ function textDisplayWidth(value) {
   return width;
 }
 
-function getCreditCardLines(index, credit) {
+function getCreditCardLines(index, credit, displayOptions = {}) {
   const mood = parseStatusMood(credit.status);
-  const grantedAt = formatShortDate(credit.granted_at);
-  const expiresAt = formatShortDate(credit.expires_at);
+  const timeFormat = displayOptions.timeFormat || 'local';
+  const grantedAt = formatDateTime(credit.granted_at, timeFormat, { withSeconds: false });
+  const expiresAt = formatDateTime(credit.expires_at, timeFormat, { withSeconds: false });
   const remaining = compactRemaining(credit.expires_at);
   const idx = String(index + 1).padStart(3, '0');
   const status = credit.status != null ? credit.status : 'N/A';
@@ -1136,17 +1566,20 @@ function buildCreditCardLines(lines, contentWidth = CREDIT_WIDTH) {
 
   return [
     paint('bold', top),
-    ...lines.map((line) => buildCreditLine(' ', line, safeWidth)),
+    ...lines.map((line) => buildCreditLine('', line, safeWidth)),
     paint('bold', bottom),
   ];
 }
 
 function printCreditCardsInSingleColumn(cards) {
+  let printedLines = 0;
   cards.forEach((card) => {
     card.lines.forEach((line) => {
       console.log(line);
+      printedLines += 1;
     });
   });
+  return printedLines;
 }
 
 function printCreditCardsInTwoColumns(cards, terminalWidth, cardWidth, gap = CREDIT_GAP) {
@@ -1154,11 +1587,12 @@ function printCreditCardsInTwoColumns(cards, terminalWidth, cardWidth, gap = CRE
   const canTwoColumns = cards.length >= 2 && terminalWidth >= cardOuterWidth * 2 + gap;
 
   if (!canTwoColumns) {
-    return false;
+    return 0;
   }
 
   const cardLines = cards.map((card) => card.lines);
   const rowHeight = Math.max(...cardLines.map((item) => item.length));
+  let printedLines = 0;
 
   for (let i = 0; i < cardLines.length; i += 2) {
     const left = cardLines[i];
@@ -1169,10 +1603,11 @@ function printCreditCardsInTwoColumns(cards, terminalWidth, cardWidth, gap = CRE
       const rightLine = right ? right[row] : '';
       const columnGap = right ? ' '.repeat(gap) : '';
       console.log(`${leftLine}${columnGap}${rightLine}`);
+      printedLines += 1;
     }
   }
 
-  return true;
+  return printedLines;
 }
 
 function getWatchCountdownSeconds(nextRefreshAt, now = Date.now()) {
@@ -1202,7 +1637,7 @@ function formatPlanName(planType) {
     .join(' ');
 }
 
-function formatRenewalTime(expiresAt) {
+function formatRenewalTime(expiresAt, timeFormat = 'local') {
   if (expiresAt === null || expiresAt === undefined || expiresAt === '') {
     return 'N/A';
   }
@@ -1215,9 +1650,7 @@ function formatRenewalTime(expiresAt) {
     return 'N/A';
   }
 
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(
-    date.getHours()
-  )}:${pad(date.getMinutes())}`;
+  return formatDateTime(date, timeFormat, { withSeconds: false });
 }
 
 function getSubscriptionExpiresAt(accountStatus, accountId) {
@@ -1247,10 +1680,30 @@ function getSubscriptionExpiresAt(accountStatus, accountId) {
     : null;
 }
 
+function getSubscriptionActiveUntil(idToken) {
+  const payloadSegment = typeof idToken === 'string' ? idToken.split('.')[1] : null;
+  if (!payloadSegment) {
+    return null;
+  }
+
+  try {
+    const payload = JSON.parse(
+      Buffer.from(payloadSegment.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8')
+    );
+    const authClaims = isObject(payload) ? payload['https://api.openai.com/auth'] : null;
+    return isObject(authClaims) ? authClaims.chatgpt_subscription_active_until ?? null : null;
+  } catch (error) {
+    return null;
+  }
+}
+
 function buildHeaderDetailLines(nowText, contentWidth, accountInfo = {}) {
   const queryTime = `${paint('dim', '查詢時間')}：${paint('cyan', nowText)}`;
   const plan = `${paint('dim', '方案')}：${paint('cyan', formatPlanName(accountInfo.planType))}`;
-  const renewal = `${paint('dim', '續約時間')}：${paint('cyan', formatRenewalTime(accountInfo.renewalAt))}`;
+  const renewal = `${paint('dim', '續約時間')}：${paint(
+    'cyan',
+    formatRenewalTime(accountInfo.renewalAt, accountInfo.timeFormat)
+  )}`;
   const accountSummary = `${plan}  ${renewal}`;
   const inlinePadding = contentWidth - textDisplayWidth(queryTime) - textDisplayWidth(accountSummary);
 
@@ -1262,8 +1715,13 @@ function buildHeaderDetailLines(nowText, contentWidth, accountInfo = {}) {
   return [queryTime, `${' '.repeat(summaryPadding)}${accountSummary}`];
 }
 
-function buildWatchControlsLine(countdownSeconds, lineWidth) {
-  const controls = paint('dim', 'Spacebar 立即刷新，q 結束監視。');
+function buildWatchControlsLine(countdownSeconds, lineWidth, showToggleHint = false) {
+  const controls = paint(
+    'dim',
+    showToggleHint
+      ? 'Spacebar 立即刷新，q 結束監視；點擊「重設時間」切換顯示。'
+      : 'Spacebar 立即刷新，q 結束監視。'
+  );
   if (countdownSeconds === null || countdownSeconds === undefined) {
     return controls;
   }
@@ -1275,12 +1733,7 @@ function buildWatchControlsLine(countdownSeconds, lineWidth) {
 
 function printHeader(contentWidth = null, watchOptions = {}) {
   const now = new Date();
-  const tzOffsetMinutes = -now.getTimezoneOffset();
-  const sign = tzOffsetMinutes >= 0 ? '+' : '-';
-  const abs = Math.abs(tzOffsetMinutes);
-  const nowText = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(
-    now.getHours()
-  )}:${pad(now.getMinutes())}:${pad(now.getSeconds())} ${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+  const nowText = formatDateTime(now, watchOptions.timeFormat || 'local', { withSeconds: true });
   const terminalWidth = getCurrentTerminalWidth();
   const resolvedContentWidth = contentWidth ||
     (terminalWidth ? Math.max(1, terminalWidth - 4) : USAGE_CARD_WIDTH);
@@ -1302,22 +1755,29 @@ function printHeader(contentWidth = null, watchOptions = {}) {
   );
 
   lines.forEach((line) => console.log(line));
+  if (watchOptions.renderState) {
+    watchOptions.renderState.row += lines.length;
+  }
 }
 
-function printManualResetSection(credits, layout) {
+function printManualResetSection(credits, layout, displayOptions = {}) {
   console.log(paint('bold', '手動重置額度'));
-  printCredits(credits, layout);
+  printCredits(credits, layout, displayOptions);
 }
 
-function prepareCreditCards(credits) {
+function prepareCreditCards(credits, minimumContentWidth = CREDIT_WIDTH, displayOptions = {}) {
   const prepared = (Array.isArray(credits) ? credits : [])
     .map((credit, index) => {
       if (!credit || typeof credit !== 'object') {
         return null;
       }
 
-      const lines = getCreditCardLines(index, credit);
-      const contentWidth = Math.max(CREDIT_WIDTH, ...lines.map((item) => textDisplayWidth(item)));
+      const lines = getCreditCardLines(index, credit, displayOptions);
+      const contentWidth = Math.max(
+        minimumContentWidth,
+        CREDIT_WIDTH,
+        ...lines.map((item) => textDisplayWidth(item))
+      );
       return {
         lines,
         width: contentWidth,
@@ -1341,15 +1801,25 @@ function prepareCreditCards(credits) {
   };
 }
 
-function getManualResetLayout(credits) {
-  const prepared = prepareCreditCards(credits);
+function getManualResetLayout(credits, displayOptions = {}) {
   const terminalWidth = getCurrentTerminalWidth();
-  const cardOuterWidth = prepared.contentWidth + 4;
+  const cappedTerminalWidth = terminalWidth > 0
+    ? Math.min(terminalWidth, MAX_LAYOUT_WIDTH)
+    : 0;
+  let prepared = prepareCreditCards(credits, CREDIT_WIDTH, displayOptions);
+  let cardOuterWidth = prepared.contentWidth + 4;
   const twoColumns =
-    prepared.cards.length >= 2 && terminalWidth >= cardOuterWidth * 2 + CREDIT_GAP;
+    prepared.cards.length >= 2 && cappedTerminalWidth >= cardOuterWidth * 2 + CREDIT_GAP;
+  // Stacked credits still share the available page width with the usage section.
+  if (!twoColumns && prepared.cards.length > 0 && cappedTerminalWidth > cardOuterWidth) {
+    prepared = prepareCreditCards(credits, cappedTerminalWidth - 4, displayOptions);
+    cardOuterWidth = prepared.contentWidth + 4;
+  }
   const totalWidth = twoColumns
     ? cardOuterWidth * 2 + CREDIT_GAP
-    : cardOuterWidth;
+    : prepared.cards.length === 0 && cappedTerminalWidth > 0
+      ? cappedTerminalWidth
+      : cardOuterWidth;
 
   return {
     ...prepared,
@@ -1360,8 +1830,9 @@ function getManualResetLayout(credits) {
   };
 }
 
-function printCredits(credits, layout = getManualResetLayout(credits)) {
+function printCredits(credits, layout = getManualResetLayout(credits), displayOptions = {}) {
   if (!layout.cards.length) {
+    printNoCreditsBox(layout);
     return;
   }
 
@@ -1373,33 +1844,340 @@ function printCredits(credits, layout = getManualResetLayout(credits)) {
   printCreditCardsInSingleColumn(layout.cards);
 }
 
+function printNoCreditsBox(layout) {
+  const contentWidth = Math.max(
+    CREDIT_WIDTH,
+    Math.min(layout.totalWidth, MAX_LAYOUT_WIDTH) - 4
+  );
+  const message = paint('dim', '目前沒有可用的手動重置額度');
+  const padding = Math.max(0, contentWidth - textDisplayWidth(message));
+  const leftPad = Math.floor(padding / 2);
+  const rightPad = padding - leftPad;
+  const top = `┌${'─'.repeat(contentWidth + 2)}┐`;
+  const bottom = `└${'─'.repeat(contentWidth + 2)}┘`;
+
+  console.log(paint('bold', top));
+  console.log(`│ ${' '.repeat(leftPad)}${message}${' '.repeat(rightPad)} │`);
+  console.log(paint('bold', bottom));
+}
+
+function createRedeemRequestId(randomUUIDFunction = crypto.randomUUID) {
+  if (typeof randomUUIDFunction === 'function') {
+    return randomUUIDFunction();
+  }
+
+  const bytes = crypto.randomBytes(16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20),
+  ].join('-');
+}
+
+function getAvailableResetCount(rateLimitResponse) {
+  if (!isObject(rateLimitResponse)) {
+    return null;
+  }
+
+  const value = toFiniteNumber(rateLimitResponse.available_count);
+  if (value === null || value < 0 || !Number.isInteger(value)) {
+    return null;
+  }
+
+  return value;
+}
+
+function getUsageWindowEntries(usage) {
+  if (!isObject(usage)) {
+    return [];
+  }
+
+  const entries = [
+    ['primary', usage.primary_window],
+    ['secondary', usage.secondary_window],
+  ];
+  const additionalLimits = Array.isArray(usage.additional_rate_limits)
+    ? usage.additional_rate_limits
+    : [];
+
+  for (const limit of additionalLimits) {
+    if (!isObject(limit)) {
+      continue;
+    }
+
+    entries.push(
+      [`additional:${limit.id}:primary`, limit.primary_window],
+      [`additional:${limit.id}:secondary`, limit.secondary_window]
+    );
+  }
+
+  return entries.filter(([, window]) => isObject(window));
+}
+
+function compareUsageDecrease(beforeUsage, afterUsage) {
+  const beforeWindows = new Map(
+    getUsageWindowEntries(beforeUsage).map(([key, window]) => [key, window.used_percent])
+  );
+  let comparable = false;
+
+  for (const [key, window] of getUsageWindowEntries(afterUsage)) {
+    const before = beforeWindows.get(key);
+    const after = window.used_percent;
+    if (typeof before !== 'number' || typeof after !== 'number') {
+      continue;
+    }
+
+    comparable = true;
+    if (after < before) {
+      return {
+        comparable: true,
+        decreased: true,
+      };
+    }
+  }
+
+  return {
+    comparable,
+    decreased: false,
+  };
+}
+
+function printResetPreview(availableCount, usage) {
+  console.log(paint('bold', '準備重置 Codex 用量'));
+  console.log(`可用手動重置額度：${availableCount}`);
+
+  const windows = getUsageWindowEntries(usage)
+    .filter(([key]) => key === 'primary' || key === 'secondary');
+  for (const [, window] of windows) {
+    console.log(`${window.name}：已使用 ${formatPercent(window.used_percent)}`);
+  }
+
+  console.log('此操作可能消耗一筆不可復原的手動重置額度。');
+}
+
+function confirmResetUsage(
+  availableCount,
+  input = process.stdin,
+  output = process.stdout
+) {
+  if (!input || !input.isTTY || !output || !output.isTTY) {
+    throw new Error('--reset 只能在互動式終端機執行');
+  }
+
+  const prompt = `輸入「確認重置用量」以使用 1 筆額度（目前可用 ${availableCount} 筆）：`;
+  const interface = readline.createInterface({
+    input,
+    output,
+  });
+
+  return new Promise((resolve) => {
+    interface.question(prompt, (answer) => {
+      interface.close();
+      resolve(answer.trim() === '確認重置用量');
+    });
+  });
+}
+
+function normalizeResetOutcome(response) {
+  if (!isObject(response)) {
+    return null;
+  }
+
+  const rawOutcome = response.code ?? response.outcome;
+  const outcomes = {
+    reset: 'reset',
+    already_redeemed: 'already_redeemed',
+    alreadyRedeemed: 'already_redeemed',
+    nothing_to_reset: 'nothing_to_reset',
+    nothingToReset: 'nothing_to_reset',
+    no_credit: 'no_credit',
+    noCredit: 'no_credit',
+  };
+
+  return outcomes[rawOutcome] || null;
+}
+
+function printResetVerificationWarnings(beforeState, afterState) {
+  const comparison = compareUsageDecrease(beforeState.usage, afterState.usage);
+  if (!comparison.comparable) {
+    console.error(
+      paint('yellow', '警告：重置已獲後端接受，但查無足夠的前後用量資料可驗證是否恢復。')
+    );
+  } else if (!comparison.decreased) {
+    console.error(
+      paint(
+        'yellow',
+        '警告：重置已獲後端接受，但重新查詢後未觀察到用量下降；請勿使用新的 UUID 立即重試。'
+      )
+    );
+  }
+
+  const beforeCount = getAvailableResetCount(beforeState.rateLimit);
+  const afterCount = getAvailableResetCount(afterState.rateLimit);
+  if (beforeCount !== null && afterCount !== null && afterCount >= beforeCount) {
+    console.error(
+      paint('yellow', '警告：重新查詢後尚未觀察到可用手動重置額度減少。')
+    );
+  }
+}
+
+async function runReset(options, dependencies = {}) {
+  const { accessToken, accountId } = loadCredentials(options.authPath);
+  const requestRateLimitFunction = dependencies.requestRateLimitFunction || requestRateLimit;
+  const requestUsageFunction = dependencies.requestUsageFunction || requestUsage;
+  const requestConsumeResetFunction =
+    dependencies.requestConsumeResetFunction || requestConsumeReset;
+  const confirmationFunction = dependencies.confirmationFunction || confirmResetUsage;
+  const renderAfterFunction = dependencies.renderAfterFunction || runOnce;
+  const createRequestIdFunction =
+    dependencies.createRequestIdFunction || createRedeemRequestId;
+
+  const [rateLimitRequest, usageRequest] = await Promise.allSettled([
+    requestRateLimitFunction(accessToken, accountId),
+    requestUsageFunction(accessToken, accountId),
+  ]);
+
+  if (rateLimitRequest.status === 'rejected') {
+    throw rateLimitRequest.reason;
+  }
+
+  const rateLimit = rateLimitRequest.value;
+  const availableCount = getAvailableResetCount(rateLimit);
+  if (availableCount === null) {
+    throw new Error('手動重置額度 API 回傳格式非預期：缺少有效的 available_count');
+  }
+  if (availableCount === 0) {
+    throw new Error('目前沒有可用的手動重置額度');
+  }
+
+  let usage = null;
+  if (usageRequest.status === 'fulfilled') {
+    try {
+      usage = normalizeUsageResponse(usageRequest.value);
+    } catch (error) {
+      console.error(
+        paint('yellow', `警告：重置前無法解析使用額度。${getErrorMessage(error)}`)
+      );
+    }
+  } else {
+    console.error(
+      paint('yellow', `警告：重置前無法查詢使用額度。${getErrorMessage(usageRequest.reason)}`)
+    );
+  }
+
+  printResetPreview(availableCount, usage);
+  if (options.force) {
+    console.log('已指定 --force，略過互動確認並直接執行重置。');
+  } else {
+    const confirmed = await confirmationFunction(availableCount);
+    if (!confirmed) {
+      console.log('已取消，未使用手動重置額度。');
+      return {
+        outcome: 'cancelled',
+      };
+    }
+  }
+
+  const redeemRequestId = options.resetRequestId || createRequestIdFunction();
+  if (!isUuid(redeemRequestId)) {
+    throw new Error('產生的重置冪等鍵不是有效的 UUID');
+  }
+
+  let consumeResponse;
+  try {
+    consumeResponse = await requestConsumeResetFunction(
+      accessToken,
+      accountId,
+      redeemRequestId
+    );
+  } catch (error) {
+    if (error && error.outcomeUncertain) {
+      throw new Error(
+        `${getErrorMessage(error)} 重置結果不明，請勿產生新的 UUID；確認後請使用 --reset=${redeemRequestId} 重試同一次操作。`
+      );
+    }
+
+    throw error;
+  }
+
+  const outcome = normalizeResetOutcome(consumeResponse);
+  if (outcome === 'nothing_to_reset') {
+    throw new Error('後端回報目前沒有符合重置資格的用量視窗；未使用手動重置額度');
+  }
+  if (outcome === 'no_credit') {
+    throw new Error('後端回報沒有可用的手動重置額度');
+  }
+  if (!outcome) {
+    const responseText = sanitizeSensitiveText(JSON.stringify(consumeResponse), [
+      accessToken,
+      accountId,
+    ]);
+    throw new Error(`重置 API 回傳未知結果：${responseText}`);
+  }
+
+  if (outcome === 'already_redeemed') {
+    console.log('相同冪等鍵的重置操作先前已完成；不會再次消耗額度。');
+  } else {
+    const windowsReset = toFiniteNumber(consumeResponse.windows_reset);
+    const suffix = windowsReset === null ? '' : `，後端回報重置 ${windowsReset} 個用量視窗`;
+    console.log(`後端已接受重置並使用 1 筆額度${suffix}。`);
+  }
+
+  console.log('重新查詢目前用量與手動重置額度：');
+  let afterState;
+  try {
+    afterState = await renderAfterFunction({
+      ...options,
+      reset: false,
+      resetRequestId: null,
+      force: false,
+    });
+  } catch (error) {
+    console.error(
+      paint(
+        'yellow',
+        `警告：後端已接受重置，但重新查詢驗證失敗。請勿使用新的 UUID 立即重試。${getErrorMessage(error)}`
+      )
+    );
+    return {
+      outcome,
+      redeemRequestId,
+      consumeResponse,
+      verification: null,
+    };
+  }
+
+  if (outcome === 'reset') {
+    printResetVerificationWarnings(
+      {
+        rateLimit,
+        usage,
+      },
+      afterState
+    );
+  }
+
+  return {
+    outcome,
+    redeemRequestId,
+    consumeResponse,
+    verification: afterState,
+  };
+}
+
 async function runOnce(options) {
   const authPath = options.authPath;
-  const auth = loadAuth(authPath);
-
-  const tokens = auth && typeof auth === 'object' && auth.tokens ? auth.tokens : {};
-  const accessToken = tokens.access_token;
-  const accountId = tokens.account_id;
-
-  if (typeof accessToken !== 'string' || !accessToken.trim()) {
-    throw new Error('auth.json 內未找到 tokens.access_token');
-  }
+  const { accessToken, accountId, idToken } = loadCredentials(authPath);
 
   const [rateLimitRequest, usageRequest, accountRequest] = await Promise.allSettled([
     requestRateLimit(accessToken, accountId),
     requestUsage(accessToken, accountId),
-    requestJson(
-      'https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27',
-      accessToken,
-      accountId,
-      {
-        Accept: 'application/json',
-        Origin: 'https://chatgpt.com',
-        Referer: 'https://chatgpt.com/',
-        'User-Agent':
-          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36',
-      }
-    ),
+    requestAccountStatus(accessToken, accountId),
   ]);
 
   if (rateLimitRequest.status === 'rejected') {
@@ -1431,6 +2209,19 @@ async function runOnce(options) {
   }
   const accountStatus = accountRequest.status === 'fulfilled' ? accountRequest.value : null;
 
+  return renderOutput(result, usage, usageRaw, usageError, accountStatus, {
+    ...options,
+    accessToken,
+    accountId,
+    renewalAtFallback: getSubscriptionActiveUntil(idToken),
+  });
+}
+
+function renderOutput(result, usage, usageRaw, usageError, accountStatus, options) {
+  const accessToken = options.accessToken;
+  const accountId = options.accountId;
+  const renewalAtFallback = options.renewalAtFallback ?? null;
+
   if (typeof options.beforeWatchRender === 'function') {
     options.beforeWatchRender();
   }
@@ -1447,6 +2238,7 @@ async function runOnce(options) {
       ...result,
       usage,
       usage_raw: usageRaw,
+      account_status: accountStatus,
     };
 
     if (usageError) {
@@ -1457,7 +2249,14 @@ async function runOnce(options) {
     }
 
     console.log(sanitizeSensitiveText(JSON.stringify(output), [accessToken, accountId]));
-    return;
+    return {
+      rateLimit: result,
+      usage,
+      usageRaw,
+      usageError,
+      accountStatus,
+      renewalAtFallback,
+    };
   }
 
   const credits = Array.isArray(result.credits)
@@ -1468,28 +2267,39 @@ async function runOnce(options) {
         ? result.data
         : [];
 
-  const manualResetLayout = getManualResetLayout(credits);
+  const displayOptions = {
+    timeFormat: options.timeFormat || 'local',
+    exactTime: Boolean(options.exactTime),
+    renderState: options.renderState || null,
+    hyperlinks: options.hyperlinks === undefined
+      ? supportsTerminalHyperlinks()
+      : Boolean(options.hyperlinks),
+    colors: options.colors === undefined ? COLOR : Boolean(options.colors),
+  };
+  const manualResetLayout = getManualResetLayout(credits, displayOptions);
   const usageCards = getUsageCards(usage);
   const usageLayout = getUsageLayout(usageCards, manualResetLayout.totalWidth);
 
   printHeader(usageLayout.boxContentWidth, {
     planType: usageRaw && typeof usageRaw === 'object' ? usageRaw.plan_type : null,
-    renewalAt: getSubscriptionExpiresAt(accountStatus, accountId),
+    renewalAt: getSubscriptionExpiresAt(accountStatus, accountId) ?? renewalAtFallback,
+    timeFormat: displayOptions.timeFormat,
+    renderState: displayOptions.renderState,
   });
   if (usageError) {
     const message = sanitizeSensitiveText(getErrorMessage(usageError), [accessToken, accountId]);
     console.error(paint('yellow', `警告：使用額度查詢失敗，仍顯示手動重置額度。${message}`));
   }
-  printUsageSection(usage, usageLayout);
+  printUsageSection(usage, usageLayout, displayOptions);
   console.log('');
-  printManualResetSection(credits, manualResetLayout);
+  printManualResetSection(credits, manualResetLayout, displayOptions);
   if (options.watch) {
     console.log('');
     const countdownSeconds = typeof options.getWatchCountdownSeconds === 'function'
       ? options.getWatchCountdownSeconds()
       : null;
     const lineWidth = usageLayout.boxContentWidth + 4;
-    const controlsLine = buildWatchControlsLine(countdownSeconds, lineWidth);
+    const controlsLine = buildWatchControlsLine(countdownSeconds, lineWidth, true);
     console.log(controlsLine);
     if (typeof options.onWatchFooterRendered === 'function') {
       options.onWatchFooterRendered({
@@ -1497,16 +2307,32 @@ async function runOnce(options) {
       });
     }
   }
+
+  return {
+    rateLimit: result,
+    usage,
+    usageRaw,
+    usageError,
+    accountStatus,
+    renewalAtFallback,
+  };
 }
 
 function startWatch(options, dependencies = {}) {
   const output = dependencies.output || process.stdout;
   const input = dependencies.input || process.stdin;
   const signalEmitter = dependencies.signalEmitter || process;
-  const refreshFunction = dependencies.refreshFunction || ((watchOptions) => runOnce({
-    ...options,
-    ...watchOptions,
-  }));
+  let lastRenderData = null;
+  const refreshFunction = dependencies.refreshFunction || (async (watchOptions) => {
+    const data = await runOnce({
+      ...options,
+      ...watchOptions,
+    });
+    if (data && typeof data === 'object') {
+      lastRenderData = data;
+    }
+    return data;
+  });
   const setIntervalFunction = dependencies.setIntervalFunction || setInterval;
   const clearIntervalFunction = dependencies.clearIntervalFunction || clearInterval;
   const setTimeoutFunction = dependencies.setTimeoutFunction || setTimeout;
@@ -1529,15 +2355,34 @@ function startWatch(options, dependencies = {}) {
   let inputWasFlowing = false;
   let rawModeChanged = false;
   let inputFlowingChanged = false;
+  let mouseTrackingEnabled = false;
+  let mouseInputBuffer = '';
+  let exactTimeMode = Boolean(options.exactTime);
+  const renderState = {
+    row: 0,
+    zones: [],
+  };
 
   const getCountdownSeconds = () => getWatchCountdownSeconds(nextRefreshAt, nowFunction());
+
+  const createPrepareScreen = () => {
+    let screenPrepared = false;
+    return () => {
+      if (!screenPrepared) {
+        clearTerminal(output);
+        renderState.row = 0;
+        renderState.zones.length = 0;
+        screenPrepared = true;
+      }
+    };
+  };
 
   const renderCountdown = () => {
     if (stopped || activeRefresh || !footerState || !output || typeof output.write !== 'function') {
       return;
     }
 
-    const line = buildWatchControlsLine(getCountdownSeconds(), footerState.lineWidth);
+    const line = buildWatchControlsLine(getCountdownSeconds(), footerState.lineWidth, true);
     output.write(`\x1b7\x1b[1A\x1b[2K${line}\x1b8`);
   };
 
@@ -1555,13 +2400,7 @@ function startWatch(options, dependencies = {}) {
       do {
         refreshPending = false;
         headerState = null;
-        let screenPrepared = false;
-        const prepareScreen = () => {
-          if (!screenPrepared) {
-            clearTerminal(output);
-            screenPrepared = true;
-          }
-        };
+        const prepareScreen = createPrepareScreen();
 
         try {
           await refreshFunction({
@@ -1570,6 +2409,8 @@ function startWatch(options, dependencies = {}) {
             onWatchFooterRendered: (state) => {
               footerState = state;
             },
+            exactTime: exactTimeMode,
+            renderState,
           });
         } catch (error) {
           prepareScreen();
@@ -1581,6 +2422,72 @@ function startWatch(options, dependencies = {}) {
     });
 
     return activeRefresh;
+  };
+
+  const rerenderFromCache = () => {
+    if (stopped || !lastRenderData) {
+      return Promise.resolve();
+    }
+
+    if (activeRefresh) {
+      refreshPending = true;
+      return activeRefresh;
+    }
+
+    activeRefresh = (async () => {
+      do {
+        refreshPending = false;
+        const prepareScreen = createPrepareScreen();
+
+        try {
+          renderOutput(
+            lastRenderData.rateLimit,
+            lastRenderData.usage,
+            lastRenderData.usageRaw,
+            lastRenderData.usageError,
+            lastRenderData.accountStatus,
+            {
+              ...options,
+              renewalAtFallback: lastRenderData.renewalAtFallback,
+              beforeWatchRender: prepareScreen,
+              getWatchCountdownSeconds: getCountdownSeconds,
+              onWatchFooterRendered: (state) => {
+                footerState = state;
+              },
+              exactTime: exactTimeMode,
+              renderState,
+            }
+          );
+        } catch (error) {
+          prepareScreen();
+          console.error(paint('red', `錯誤：重新繪製失敗：${getErrorMessage(error)}`));
+        }
+      } while (refreshPending && !stopped);
+    })().finally(() => {
+      activeRefresh = null;
+    });
+
+    return activeRefresh;
+  };
+
+  const handleMouseEvent = (event) => {
+    if (!event.press || event.button !== 0) {
+      return;
+    }
+
+    const hit = renderState.zones.some(
+      (zone) => zone.row === event.row && event.col >= zone.colStart && event.col <= zone.colEnd
+    );
+    if (!hit) {
+      return;
+    }
+
+    exactTimeMode = !exactTimeMode;
+    if (lastRenderData) {
+      void rerenderFromCache();
+    } else {
+      void refresh();
+    }
   };
 
   const handleResize = () => {
@@ -1630,6 +2537,9 @@ function startWatch(options, dependencies = {}) {
     if (resizeTimeoutHandle !== null) {
       clearTimeoutFunction(resizeTimeoutHandle);
     }
+    if (mouseTrackingEnabled && output && typeof output.write === 'function') {
+      output.write('\x1b[?1000l');
+    }
     if (output && typeof output.removeListener === 'function') {
       output.removeListener('resize', handleResize);
     }
@@ -1656,13 +2566,21 @@ function startWatch(options, dependencies = {}) {
   };
 
   const handleInput = (chunk) => {
-    const value = String(chunk);
-    if (value.includes('\u0003') || value.includes('q')) {
+    mouseInputBuffer += String(chunk);
+    if (mouseInputBuffer.length > MOUSE_INPUT_BUFFER_LIMIT) {
+      mouseInputBuffer = mouseInputBuffer.slice(-MOUSE_INPUT_BUFFER_LIMIT);
+    }
+
+    const { events, rest } = extractMouseEvents(mouseInputBuffer);
+    mouseInputBuffer = rest;
+    events.forEach(handleMouseEvent);
+
+    if (rest.includes('\u0003') || rest.includes('q')) {
       handleSignal();
       return;
     }
 
-    if (value.includes(' ')) {
+    if (rest.includes(' ')) {
       resetAutoRefreshTimer();
       void refresh();
     }
@@ -1681,6 +2599,10 @@ function startWatch(options, dependencies = {}) {
     if (typeof input.setRawMode === 'function' && !inputWasRaw) {
       input.setRawMode(true);
       rawModeChanged = true;
+    }
+    if (output && typeof output.write === 'function') {
+      output.write('\x1b[?1000h');
+      mouseTrackingEnabled = true;
     }
     input.on('data', handleInput);
     if (!inputWasFlowing && typeof input.resume === 'function') {
@@ -1703,6 +2625,11 @@ function startWatch(options, dependencies = {}) {
 
 async function main() {
   const options = getCliOptions(process.argv.slice(2));
+  if (options.reset) {
+    await runReset(options);
+    return;
+  }
+
   if (options.watch) {
     const watcher = startWatch(options);
     await watcher.ready;
@@ -1720,10 +2647,19 @@ if (require.main === module) {
 }
 
 module.exports = {
+  APP_VERSION,
+  GPT_RESERVE_HELP_URL,
   buildApiHeaders,
   buildRoundedBoxLines,
+  compareUsageDecrease,
+  confirmResetUsage,
+  createRedeemRequestId,
+  extractMouseEvents,
   formatCompactDurationFromSeconds,
+  formatDateTime,
+  formatUsageCardTitle,
   formatUsageReset,
+  getAvailableResetCount,
   getCliOptions,
   getWatchCountdownSeconds,
   getCurrentTerminalWidth,
@@ -1732,13 +2668,25 @@ module.exports = {
   getUsageCards,
   getUsageLayout,
   main,
+  normalizeAdditionalRateLimitName,
+  normalizeAdditionalRateLimits,
   normalizeUsageResponse,
   normalizeUsageWindow,
+  normalizeResetOutcome,
+  printUsage,
+  printVersion,
+  renderOutput,
   requestJson,
+  requestJsonRequest,
+  requestAccountStatus,
+  requestConsumeReset,
   requestRateLimit,
   requestUsage,
   runOnce,
+  runReset,
   sanitizeSensitiveText,
   startWatch,
+  supportsTerminalHyperlinks,
   terminalSizeChanged,
+  textDisplayWidth,
 };
